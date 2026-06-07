@@ -1,145 +1,202 @@
-// ══════════════════════════════════════════════════════════════════════════════
-// server.js  —  Сервер мультиплеера Survivor Quest
-//
-// БЫСТРЫЙ ЗАПУСК (бесплатно):
-//   1. Зайдите на https://glitch.com → New Project → Import from GitHub
-//   2. Загрузите этот файл как server.js и добавьте package.json (ниже)
-//   3. Замените SERVER_URL в MultiplayerManager.java на ваш URL
-//
-// Или локально:
-//   npm install ws
-//   node server.js
-// ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════
+// server.js — Survivor Quest Multiplayer Server
+// Деплой на Render: https://render.com (Free tier, Node.js)
+// ══════════════════════════════════════════════════════════════════
 
-const WebSocket = require("ws");
+const WebSocket = require('ws');
+const http = require('http');
+
 const PORT = process.env.PORT || 3000;
 
-const wss = new WebSocket.Server({ port: PORT });
-const rooms = {}; // { code: { host, players: [{ ws, id, nick }] } }
-
-function makeCode() {
-  return Math.random().toString(36).slice(2, 6).toUpperCase();
-}
-
-function broadcast(room, msg, excludeId) {
-  const json = JSON.stringify(msg);
-  for (const p of room.players) {
-    if (p.id !== excludeId && p.ws.readyState === WebSocket.OPEN) {
-      p.ws.send(json);
-    }
-  }
-}
-
-function send(ws, msg) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-}
-
-wss.on("connection", (ws) => {
-  let playerId = null;
-  let playerNick = "Игрок";
-  let playerRoom = null;
-
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    const { type, id, nick, data } = msg;
-    if (!type) return;
-
-    // Первое сообщение — приветствие
-    if (type === "hello") {
-      playerId = id || ("guest_" + Date.now());
-      playerNick = nick || "Игрок";
-      return;
-    }
-
-    if (!playerId) return;
-
-    switch (type) {
-      case "create_room": {
-        let code = makeCode();
-        while (rooms[code]) code = makeCode(); // уникальность
-        const room = { host: playerId, players: [{ ws, id: playerId, nick: playerNick }] };
-        rooms[code] = room;
-        playerRoom = code;
-        send(ws, { type: "room_created", data: { code } });
-        console.log(`[${code}] created by ${playerNick}`);
-        break;
-      }
-
-      case "join_room": {
-        const code = (data.code || "").toUpperCase().trim();
-        const room = rooms[code];
-        if (!room) {
-          send(ws, { type: "error", data: { message: `Комната ${code} не найдена` } });
-          return;
-        }
-        if (room.players.length >= 4) {
-          send(ws, { type: "error", data: { message: "Комната заполнена (макс. 4 игрока)" } });
-          return;
-        }
-        // Список уже существующих игроков для нового
-        const existing = room.players.map(p => ({ id: p.id, nickname: p.nick }));
-        room.players.push({ ws, id: playerId, nick: playerNick });
-        playerRoom = code;
-
-        send(ws, { type: "room_joined", data: { code, players: existing } });
-
-        // Уведомить остальных
-        broadcast(room, {
-          type: "player_joined",
-          data: { id: playerId, nickname: playerNick }
-        }, playerId);
-
-        console.log(`[${code}] ${playerNick} joined (${room.players.length}/4)`);
-        break;
-      }
-
-      case "start_game": {
-        const room = rooms[playerRoom];
-        if (!room || room.host !== playerId) return;
-        broadcast(room, { type: "game_start", data: {} }, null);
-        send(ws, { type: "game_start", data: {} });
-        console.log(`[${playerRoom}] game started`);
-        break;
-      }
-
-      case "player_state": {
-        const room = rooms[playerRoom];
-        if (!room) return;
-        broadcast(room, {
-          type: "player_state",
-          data: { id: playerId, nick: playerNick, ...data }
-        }, playerId);
-        break;
-      }
-
-      case "chat": {
-        const room = rooms[playerRoom];
-        if (!room) return;
-        broadcast(room, {
-          type: "chat",
-          data: { nick: playerNick, message: data.message || "" }
-        }, null);
-        break;
-      }
-    }
-  });
-
-  ws.on("close", () => {
-    if (!playerRoom || !rooms[playerRoom]) return;
-    const room = rooms[playerRoom];
-    room.players = room.players.filter(p => p.id !== playerId);
-    console.log(`[${playerRoom}] ${playerNick} left (${room.players.length} left)`);
-
-    if (room.players.length === 0) {
-      delete rooms[playerRoom];
-      console.log(`[${playerRoom}] room deleted`);
-    } else {
-      if (room.host === playerId) room.host = room.players[0].id;
-      broadcast(room, { type: "player_left", data: { id: playerId } }, null);
-    }
-  });
+// HTTP сервер (нужен для Render health check)
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Survivor Quest Server OK\n');
 });
 
-console.log(`Survivor Quest MP server running on ws://localhost:${PORT}`);
+const wss = new WebSocket.Server({ server });
+
+// rooms: { roomCode -> { host, players: Map<id, {ws, nick}> } }
+const rooms = new Map();
+
+function generateCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+}
+
+function broadcast(room, message, excludeId = null) {
+    if (!room) return;
+    const text = JSON.stringify(message);
+    room.players.forEach((player, id) => {
+        if (id !== excludeId && player.ws.readyState === WebSocket.OPEN) {
+            player.ws.send(text);
+        }
+    });
+}
+
+function findRoomByPlayerId(playerId) {
+    for (const [code, room] of rooms) {
+        if (room.players.has(playerId)) return { code, room };
+    }
+    return null;
+}
+
+wss.on('connection', (ws) => {
+    let playerId = null;
+    let playerNick = 'Игрок';
+
+    ws.on('message', (data) => {
+        let msg;
+        try { msg = JSON.parse(data); } catch (e) { return; }
+
+        const type = msg.type;
+        const id   = msg.id   || '';
+        const nick = msg.nick || 'Игрок';
+        const msgData = msg.data || {};
+
+        switch (type) {
+
+            case 'hello': {
+                playerId   = id;
+                playerNick = nick;
+                break;
+            }
+
+            case 'create_room': {
+                if (!playerId) break;
+                let code;
+                do { code = generateCode(); } while (rooms.has(code));
+
+                const room = { host: playerId, players: new Map() };
+                room.players.set(playerId, { ws, nick: playerNick });
+                rooms.set(code, room);
+
+                ws.send(JSON.stringify({
+                    type: 'room_created',
+                    data: { code }
+                }));
+                console.log(`Room ${code} created by ${playerNick}`);
+                break;
+            }
+
+            case 'join_room': {
+                if (!playerId) break;
+                const code = (msgData.code || '').toUpperCase().trim();
+                const room = rooms.get(code);
+
+                if (!room) {
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        data: { message: 'Комната не найдена: ' + code }
+                    }));
+                    break;
+                }
+
+                if (room.players.size >= 4) {
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        data: { message: 'Комната заполнена' }
+                    }));
+                    break;
+                }
+
+                // Список уже существующих игроков
+                const existingPlayers = [];
+                room.players.forEach((p, pid) => {
+                    existingPlayers.push({ id: pid, nickname: p.nick });
+                });
+
+                room.players.set(playerId, { ws, nick: playerNick });
+
+                // Сообщаем вошедшему
+                ws.send(JSON.stringify({
+                    type: 'room_joined',
+                    data: { code, players: existingPlayers }
+                }));
+
+                // Сообщаем остальным
+                broadcast(room, {
+                    type: 'player_joined',
+                    id: playerId,
+                    data: { id: playerId, nickname: playerNick }
+                }, playerId);
+
+                console.log(`${playerNick} joined room ${code}`);
+                break;
+            }
+
+            case 'start_game': {
+                const found = findRoomByPlayerId(playerId);
+                if (!found) break;
+                const { room } = found;
+                if (room.host !== playerId) break; // только хост
+
+                // Рассылаем всем включая хоста
+                const startMsg = JSON.stringify({
+                    type: 'game_start',
+                    data: {
+                        seed:       msgData.seed       || Date.now(),
+                        difficulty: msgData.difficulty || 1
+                    }
+                });
+                room.players.forEach((p) => {
+                    if (p.ws.readyState === WebSocket.OPEN) p.ws.send(startMsg);
+                });
+                console.log(`Game started in room ${found.code}, seed=${msgData.seed}`);
+                break;
+            }
+
+            // ── Сообщения которые пересылаются всем кроме отправителя ────────
+            case 'player_state':
+            case 'bullet':
+            case 'team_settings':
+            case 'chat': {
+                const found = findRoomByPlayerId(playerId);
+                if (!found) break;
+                broadcast(found.room, {
+                    type,
+                    id:   playerId,
+                    nick: playerNick,
+                    data: msgData
+                }, playerId);
+                break;
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        if (!playerId) return;
+        const found = findRoomByPlayerId(playerId);
+        if (!found) return;
+        const { code, room } = found;
+
+        room.players.delete(playerId);
+        console.log(`${playerNick} left room ${code}`);
+
+        if (room.players.size === 0) {
+            rooms.delete(code);
+            console.log(`Room ${code} deleted (empty)`);
+        } else {
+            // Если ушёл хост — новый хост первый из оставшихся
+            if (room.host === playerId) {
+                room.host = room.players.keys().next().value;
+                console.log(`New host in room ${code}: ${room.host}`);
+            }
+            broadcast(room, {
+                type: 'player_left',
+                data: { id: playerId }
+            });
+        }
+    });
+
+    ws.on('error', (err) => {
+        console.error('WS error:', err.message);
+    });
+});
+
+server.listen(PORT, () => {
+    console.log(`Survivor Quest server running on port ${PORT}`);
+});
+                                                               

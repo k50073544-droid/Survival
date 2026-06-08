@@ -152,7 +152,9 @@ wss.on('connection', (ws) => {
             case 'player_state':
             case 'bullet':
             case 'team_settings':
-            case 'chat': {
+            case 'chat':
+            case 'enemy_sync':
+            case 'enemy_hit': {
                 const found = findRoomByPlayerId(playerId);
                 if (!found) break;
                 broadcast(found.room, {
@@ -199,4 +201,4 @@ wss.on('connection', (ws) => {
 server.listen(PORT, () => {
     console.log(`Survivor Quest server running on port ${PORT}`);
 });
-                                                               
+                
